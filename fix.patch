@@ -1,0 +1,142 @@
+commit 7bef4f6695e75a2beffac4c02730dac9fefd243b
+Author: Epsilon0xCell <332253088+Epsilon0xCell@users.noreply.github.com>
+Date:   Thu Nov 12 22:17:36 2026 +0000
+
+    Scrub case variants, semicolon-separated and encoded keys in logged URIs
+    
+    The _scrub_uri helper matched query keys case-sensitively and split the query only on "&". Case variants of the listed keys, a token behind a semicolon separator, and a percent-encoded key all kept their values on the way to the logs. Keys are now decoded and lowercased before matching, extra keys are lowercased to match, the query splits on both separators, and password joins the default scrub list.
+
+diff --git a/jupyter_server/log.py b/jupyter_server/log.py
+index d3ce811d9..7755d7229 100644
+--- a/jupyter_server/log.py
++++ b/jupyter_server/log.py
+@@ -7,7 +7,8 @@
+ #  the file LICENSE, distributed as part of this software.
+ # -----------------------------------------------------------------------------
+ import json
+-from urllib.parse import urlparse, urlunparse
++import re
++from urllib.parse import unquote, urlparse, urlunparse
+ 
+ from tornado.log import access_log
+ 
+@@ -17,29 +18,37 @@ from .prometheus.log_functions import prometheus_log_method
+ # url params to be scrubbed if seen
+ # any url param that *contains* one of these
+ # will be scrubbed from logs
+-_DEFAULT_SCRUB_PARAM_KEYS = {"token", "auth", "key", "code", "state", "xsrf"}
++_DEFAULT_SCRUB_PARAM_KEYS = {"token", "auth", "key", "code", "state", "xsrf", "password"}
+ 
+ 
+ def _scrub_uri(uri: str, extra_param_keys=None) -> str:
+     """scrub auth info from uri"""
+ 
+-    scrub_param_keys = _DEFAULT_SCRUB_PARAM_KEYS.union(set(extra_param_keys or []))
++    scrub_param_keys = {
++        key.lower() for key in _DEFAULT_SCRUB_PARAM_KEYS.union(extra_param_keys or [])
++    }
+ 
+     parsed = urlparse(uri)
+     if parsed.query:
+         # check for potentially sensitive url params
+         # use manual list + split rather than parsing
+         # to minimally perturb original
+-        parts = parsed.query.split("&")
++        # split on both "&" and ";", keeping the separators,
++        # so the query is reassembled exactly as given
++        tokens = re.split(r"([&;])", parsed.query)
+         changed = False
+-        for i, s in enumerate(parts):
+-            key, sep, _value = s.partition("=")
++        for i in range(0, len(tokens), 2):
++            key, sep, _value = tokens[i].partition("=")
++            # match against the decoded, lowercased key, so that
++            # case variants and percent-encoded keys are caught
++            decoded_key = unquote(key).lower()
+             for substring in scrub_param_keys:
+-                if substring in key:
+-                    parts[i] = f"{key}{sep}[secret]"
++                if substring in decoded_key:
++                    tokens[i] = f"{key}{sep}[secret]"
+                     changed = True
++                    break
+         if changed:
+-            parsed = parsed._replace(query="&".join(parts))
++            parsed = parsed._replace(query="".join(tokens))
+             return urlunparse(parsed)
+     return uri
+ 
+diff --git a/jupyter_server/serverapp.py b/jupyter_server/serverapp.py
+index a98cbb09b..b96283790 100644
+--- a/jupyter_server/serverapp.py
++++ b/jupyter_server/serverapp.py
+@@ -2032,7 +2032,7 @@ class ServerApp(JupyterApp):
+         sensitive information like authentication tokens from being leaked
+         in log files.
+ 
+-        Default scrubbed keys: ["token", "auth", "key", "code", "state", "xsrf"]
++        Default scrubbed keys: ["token", "auth", "key", "code", "state", "xsrf", "password"]
+         """,
+     )
+ 
+diff --git a/tests/test_log.py b/tests/test_log.py
+index 575093c6e..d0e4113c6 100644
+--- a/tests/test_log.py
++++ b/tests/test_log.py
+@@ -4,7 +4,7 @@ from unittest.mock import Mock
+ 
+ import pytest
+ 
+-from jupyter_server.log import log_request
++from jupyter_server.log import _scrub_uri, log_request
+ from jupyter_server.serverapp import ServerApp
+ 
+ 
+@@ -23,6 +23,47 @@ def server_app_with_default_scrub_keys():
+     return app
+ 
+ 
++# A stand-in secret value, assembled at runtime; the tests below
++# assert that it never survives _scrub_uri.
++SECRET_VALUE = "CAN" + "ARY" + "-VALUE-12345"
++
++
++@pytest.mark.parametrize(
++    "query",
++    [
++        # case variants of the listed keys
++        "Token=",
++        "TOKEN=",
++        "Code=",
++        "State=",
++        "_XSRF=",
++        # a semicolon-separated parameter is its own parameter
++        "a=1;token=",
++        # percent-encoded key
++        "%74oken=",
++        # credential parameter covered by the default key list
++        "password=",
++    ],
++)
++def test_scrub_uri_scrubs_reported_shapes(query):
++    """Keys are matched after decoding and lowercasing, and on both separators."""
++    uri = f"http://example.com/path?{query}{SECRET_VALUE}"
++    assert SECRET_VALUE not in _scrub_uri(uri)
++
++
++def test_scrub_uri_leaves_benign_query_unchanged():
++    uri = "http://example.com/tree?normal=value&other=1"
++    assert _scrub_uri(uri) == uri
++
++
++def test_scrub_uri_preserves_separators_and_sibling_params():
++    uri = f"http://example.com/tree?a=1;token={SECRET_VALUE}"
++    out = _scrub_uri(uri)
++    assert SECRET_VALUE not in out
++    assert out.startswith("http://example.com/tree?a=1;token=")
++    assert "&" not in out
++
++
+ def test_log_request_scrubs_sensitive_params_default(server_app_with_default_scrub_keys, caplog):
+     """Test that log_request scrubs sensitive parameters using default configuration."""
+     handler = Mock()
